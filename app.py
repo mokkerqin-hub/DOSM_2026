@@ -47,7 +47,9 @@ SEED = 42
 np.random.seed(SEED)
 
 PANEL_FILE = "master_panel_state_year.csv"
-POPULATION_FILE = "population_state.csv"
+# First match wins. The cleaned file is preferred; the raw OpenDOSM long-format
+# file is accepted as a fallback and filtered down on load.
+POPULATION_FILES = ["clean_Population_state.csv", "population_state.csv"]
 
 MICRO_TERRITORIES = ["W.P. Putrajaya", "W.P. Labuan"]          # D-10
 CLUSTER_FEATURES = ["intensity", "occupancy_pct", "growth_vs_2019"]
@@ -89,17 +91,67 @@ def load_panel():
 
 @st.cache_data
 def load_population():
-    """Total population by state-year from the OpenDOSM long-format file."""
-    pop = pd.read_csv(POPULATION_FILE)
-    pop["date"] = pd.to_datetime(pop["date"])
-    pop["year"] = pop["date"].dt.year
+    """Total population by state-year.
 
-    total = pop[
-        (pop["sex"] == "both")
-        & (pop["age"] == "overall")
-        & (pop["ethnicity"] == "overall")
-    ]
-    return total[["state", "year", "population"]].reset_index(drop=True)
+    Accepts either shape without being told which:
+      - already cleaned: state, year, population
+      - raw OpenDOSM long format: state, date, sex, age, ethnicity, population
+        (filtered here to the overall totals)
+
+    Returns (dataframe, filename, note) so the UI can show what was used.
+    """
+    import os
+
+    path = next((f for f in POPULATION_FILES if os.path.exists(f)), None)
+    if path is None:
+        raise FileNotFoundError(
+            "No population file found. Expected one of: "
+            + ", ".join(POPULATION_FILES)
+        )
+
+    pop = pd.read_csv(path)
+    note = "used as-is"
+
+    # Derive year from a date column if year is not already present.
+    if "year" not in pop.columns:
+        date_col = next(
+            (c for c in pop.columns if c.lower() in {"date", "period", "ref_date"}), None
+        )
+        if date_col is None:
+            raise ValueError(
+                f"{path} has no 'year' column and no date column to derive it from. "
+                f"Columns found: {list(pop.columns)}"
+            )
+        pop["year"] = pd.to_datetime(pop[date_col]).dt.year
+
+    # Long format: collapse to the overall totals.
+    breakdown = [c for c in ["sex", "age", "ethnicity"] if c in pop.columns]
+    if breakdown:
+        mask = pd.Series(True, index=pop.index)
+        for col in breakdown:
+            mask &= pop[col].astype(str).str.lower().isin({"both", "overall", "total"})
+        pop = pop[mask]
+        note = f"filtered to overall totals on {', '.join(breakdown)}"
+
+    value_col = next(
+        (c for c in pop.columns if c.lower() in {"population", "population_thousand", "value"}),
+        None,
+    )
+    if value_col is None:
+        raise ValueError(
+            f"{path} has no population column. Columns found: {list(pop.columns)}"
+        )
+    pop = pop.rename(columns={value_col: "population"})
+
+    out = pop[["state", "year", "population"]].drop_duplicates().reset_index(drop=True)
+
+    dupes = out.duplicated(subset=["state", "year"]).sum()
+    if dupes:
+        raise ValueError(
+            f"{path} has {dupes} duplicate state-year rows after filtering. "
+            "Check that the breakdown columns collapsed correctly."
+        )
+    return out, path, note
 
 
 def build_features(df):
@@ -513,12 +565,16 @@ st.sidebar.caption(f"Seed fixed at {SEED}. scikit-learn defaults unless noted.")
 # ------------------------------------------------------------------- load
 try:
     panel = load_panel()
-    population = load_population()
+    population, population_source, population_note = load_population()
 except FileNotFoundError as exc:
     st.error(
-        f"Missing file: {exc.filename}. Put {PANEL_FILE} and {POPULATION_FILE} "
-        "in the same folder as app.py."
+        f"Missing data file. Put {PANEL_FILE} and one of "
+        f"({', '.join(POPULATION_FILES)}) in the same folder as app.py.\n\n"
+        f"Details: {exc}"
     )
+    st.stop()
+except ValueError as exc:
+    st.error(f"Could not read the population file.\n\n{exc}")
     st.stop()
 
 clustering = run_clustering(panel, cluster_start, k_choice, n_bootstrap)
@@ -855,6 +911,36 @@ with tabs[3]:
             }
         )
     st.dataframe(pd.DataFrame(rows).round(4), width="stretch", hide_index=True)
+
+    st.subheader("Population source")
+    st.caption(
+        "Which file was read and how it was interpreted. The cross-check "
+        "compares it against the panel's own population column — they should "
+        "agree, since the panel was built from the same source."
+    )
+    merged = panel.merge(population, on=["state", "year"], how="left")
+    gap = (merged["population_thousand"] - merged["population"]).abs()
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {"check": "File used", "value": population_source},
+                {"check": "Handling", "value": population_note},
+                {"check": "Rows", "value": str(len(population))},
+                {"check": "Years", "value": f"{population['year'].min()}–{population['year'].max()}"},
+                {"check": "Unmatched panel rows", "value": str(int(merged['population'].isna().sum()))},
+                {"check": "Max disagreement vs panel", "value": f"{gap.max():.6f}"},
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+    if gap.max() > 0.01:
+        st.warning(
+            f"Population figures disagree with the panel by up to {gap.max():.4f}. "
+            "Differences below ~0.0001 are rounding; anything larger means the two "
+            "sources are not the same and needs checking before use.",
+            icon="⚠️",
+        )
 
     st.subheader("Panel integrity")
     st.dataframe(
